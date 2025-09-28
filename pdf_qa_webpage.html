@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>PDF-QA — Upload, scan & ask questions</title>
+  <!-- Minimal, modern styling -->
+  <style>
+    :root{--bg:#0f1724;--card:#0b1220;--accent:#7c3aed;--muted:#94a3b8;--glass:rgba(255,255,255,0.03)}
+    *{box-sizing:border-box}
+    html,body{height:100%;margin:0;font-family:Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;color:#e6eef8;background:linear-gradient(180deg,#071129 0%, #071428 60%);}
+    .wrap{max-width:1100px;margin:32px auto;padding:24px}
+    header{display:flex;align-items:center;gap:16px;margin-bottom:18px}
+    header h1{font-size:20px;margin:0}
+    .grid{display:grid;grid-template-columns:360px 1fr;gap:18px}
+
+    .card{background:var(--card);border-radius:12px;padding:14px;box-shadow:0 6px 20px rgba(2,6,23,0.6);}
+    .uploader{display:flex;flex-direction:column;gap:10px}
+    input[type=file]{padding:6px;background:var(--glass);border-radius:8px;border:1px dashed rgba(255,255,255,0.04);color:var(--muted)}
+    button{background:linear-gradient(90deg,var(--accent),#4f46e5);border:none;color:white;padding:10px 12px;border-radius:10px;cursor:pointer}
+    button:disabled{opacity:0.5;cursor:default}
+    .progress{height:8px;background:rgba(255,255,255,0.04);border-radius:6px;overflow:hidden}
+    .progress > i{display:block;height:100%;width:0;background:linear-gradient(90deg,#60a5fa,#7c3aed)}
+    .meta{font-size:13px;color:var(--muted)}
+
+    .viewer{display:flex;flex-direction:column;gap:12px}
+    .controls{display:flex;gap:8px;align-items:center}
+    .textarea, input[type=text]{width:100%;padding:10px;border-radius:8px;border:1px solid rgba(255,255,255,0.04);background:transparent;color:#dbeafe}
+    .answers{margin-top:8px;display:flex;flex-direction:column;gap:8px}
+    .answer{background:linear-gradient(180deg,rgba(255,255,255,0.02),rgba(255,255,255,0.01));padding:12px;border-radius:10px;border:1px solid rgba(255,255,255,0.02)}
+    .chunks{font-family:monospace;white-space:pre-wrap;color:#c7d2fe;font-size:13px}
+    footer{margin-top:18px;color:var(--muted);font-size:13px}
+
+    /* mobile */
+    @media (max-width:900px){.grid{grid-template-columns:1fr;}}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <h1>PDF-QA — Upload a PDF, scan it, and ask questions</h1>
+    </header>
+
+    <div class="grid">
+      <div class="card">
+        <div class="uploader">
+          <label class="meta">Choose a PDF file (client-side only)</label>
+          <input id="fileInput" type="file" accept="application/pdf" />
+
+          <div class="meta">PDF status: <span id="status">No file loaded</span></div>
+          <div class="progress" aria-hidden="true"><i id="progressBar"></i></div>
+
+          <div style="display:flex;gap:8px;margin-top:6px">
+            <button id="btnExtract" disabled>Extract text</button>
+            <button id="btnClear">Clear</button>
+          </div>
+
+          <div style="margin-top:10px">
+            <div class="meta">Quick tips:</div>
+            <ul style="color:var(--muted);font-size:13px">
+              <li>Everything runs in your browser. Files are not uploaded to any server.</li>
+              <li>If the PDF contains scanned images (no selectable text), text extraction will fail — you'll need OCR.</li>
+              <li>Search is a simple TF-cosine semantic-ish matching over chunks; it's lightweight and fast for small/medium PDFs.</li>
+            </ul>
+          </div>
+        </div>
+      </div>
+
+      <div class="card viewer">
+        <div class="controls">
+          <input id="queryInput" type="text" placeholder="Ask a question about the PDF (e.g. 'What is the date of the agreement?')" />
+          <button id="btnAsk" disabled>Ask</button>
+        </div>
+
+        <div class="meta">Extracted text preview (first ~2000 characters):</div>
+        <div id="preview" class="chunks" style="max-height:220px;overflow:auto;background:rgba(255,255,255,0.01);padding:10px;border-radius:8px"></div>
+
+        <div class="meta">Answers / matches:</div>
+        <div id="answers" class="answers"></div>
+
+        <footer>
+          <div class="meta">Built with <strong>pdf.js</strong> and pure JavaScript. Use the 'Extract text' button to read the PDF into memory, then ask questions.</div>
+        </footer>
+      </div>
+    </div>
+  </div>
+
+  <!-- pdf.js from CDN -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.10.996/pdf.min.js"></script>
+  <script>
+    // Configure PDF.js worker (CDN)
+    if (window.pdfjsLib) {
+      window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.10.996/pdf.worker.min.js';
+    }
+
+    // State
+    let pdfDoc = null;
+    let rawText = '';
+    let chunks = []; // {text,tf}
+
+    const fileInput = document.getElementById('fileInput');
+    const status = document.getElementById('status');
+    const progressBar = document.getElementById('progressBar');
+    const btnExtract = document.getElementById('btnExtract');
+    const btnClear = document.getElementById('btnClear');
+    const preview = document.getElementById('preview');
+    const btnAsk = document.getElementById('btnAsk');
+    const queryInput = document.getElementById('queryInput');
+    const answersDiv = document.getElementById('answers');
+
+    fileInput.addEventListener('change', () => {
+      const f = fileInput.files[0];
+      if (!f) return;
+      if (f.type !== 'application/pdf') {
+        alert('Please select a PDF file');
+        return;
+      }
+      status.textContent = `Loaded file: ${f.name} — ${Math.round(f.size/1024)} KB`;
+      btnExtract.disabled = false;
+    });
+
+    btnClear.addEventListener('click', () => {
+      pdfDoc = null; rawText = ''; chunks = []; preview.textContent = ''; answersDiv.innerHTML = ''; status.textContent = 'Cleared'; btnExtract.disabled=true; btnAsk.disabled=true; queryInput.value=''; progressBar.style.width='0%'; fileInput.value='';
+    });
+
+    btnExtract.addEventListener('click', async () => {
+      const f = fileInput.files[0];
+      if (!f) return alert('Choose a PDF file first');
+      btnExtract.disabled = true; status.textContent = 'Reading PDF…';
+
+      const arrayBuffer = await f.arrayBuffer();
+      try {
+        pdfDoc = await window.pdfjsLib.getDocument({data: arrayBuffer}).promise;
+      } catch (e) {
+        console.error(e); alert('Failed to load PDF with pdf.js'); status.textContent='Failed'; btnExtract.disabled=false; return;
+      }
+
+      const n = pdfDoc.numPages;
+      status.textContent = `PDF loaded — ${n} pages. Extracting text...`;
+      rawText = '';
+      for (let i=1;i<=n;i++){
+        const page = await pdfDoc.getPage(i);
+        const txt = await page.getTextContent();
+        const pageText = txt.items.map(it=>it.str).join(' ');
+        rawText += '\n\n' + pageText;
+        const pct = Math.round((i/n)*100);
+        progressBar.style.width = pct + '%';
+      }
+
+      // Basic heuristic: if no text found -> likely scanned image PDF
+      if (!rawText || rawText.replace(/\s+/g,'').length < 20) {
+        status.textContent = 'No extractable text found — this PDF may be scanned images (use OCR).';
+        preview.textContent = 'No selectable text found in this PDF.';
+        btnAsk.disabled = true;
+        return;
+      }
+
+      status.textContent = 'Text extracted. Building search index...';
+      preview.textContent = rawText.slice(0, 2000) + (rawText.length>2000? '\n\n... (truncated)':'');
+
+      // Build chunks and TF vectors
+      buildChunks(rawText);
+      status.textContent = `Ready — extracted ${rawText.length} characters, ${chunks.length} chunks.`;
+      btnAsk.disabled = false;
+    });
+
+    btnAsk.addEventListener('click', () => {
+      const q = queryInput.value.trim();
+      if (!q) return; answersDiv.innerHTML = '<div class="meta">Searching...</div>';
+      const results = searchQuery(q, 5);
+      renderResults(q, results);
+    });
+
+    // ========== Text processing utilities ==========
+    function tokenize(s){
+      return s.toLowerCase().replace(/[\W_]+/g,' ').split(/\s+/).filter(Boolean);
+    }
+
+    function buildChunks(text){
+      // Split to paragraphs/sentences, then group into chunks ~500-1000 chars
+      const paras = text.split(/\n\s*\n/).map(p=>p.trim()).filter(Boolean);
+      const target = 900; // desired chunk size
+      chunks = [];
+      let buffer = '';
+      for (const p of paras){
+        if ((buffer + ' ' + p).length > target) {
+          if (buffer.trim()) chunks.push({text: buffer.trim(), tf: termFreq(buffer)});
+          buffer = p;
+        } else {
+          buffer = buffer ? (buffer + ' ' + p) : p;
+        }
+      }
+      if (buffer.trim()) chunks.push({text: buffer.trim(), tf: termFreq(buffer)});
+      // compute idf across chunks
+      const idf = computeIdf(chunks.map(c=>c.text));
+      // convert each tf to tf-idf vector
+      for (const c of chunks){
+        c.vector = tfIdfVector(c.tf, idf);
+      }
+    }
+
+    function termFreq(text){
+      const toks = tokenize(text);
+      const tf = {};
+      for (const t of toks){ tf[t] = (tf[t]||0)+1; }
+      // normalize by length
+      const len = toks.length || 1;
+      for (const k in tf) tf[k] = tf[k]/len;
+      return tf;
+    }
+
+    function computeIdf(texts){
+      const N = texts.length;
+      const df = {};
+      for (const t of texts){
+        const seen = new Set(tokenize(t));
+        for (const w of seen) df[w] = (df[w]||0)+1;
+      }
+      const idf = {};
+      for (const k in df){ idf[k] = Math.log((N+1)/(df[k]+1)) + 1; }
+      return idf;
+    }
+
+    function tfIdfVector(tf, idf){
+      const v = {};
+      for (const k in tf){ v[k] = tf[k] * (idf[k] || 1); }
+      return v;
+    }
+
+    function dot(a,b){
+      let s=0; for(const k in a){ if(b[k]) s += a[k]*b[k]; } return s;
+    }
+    function norm(a){ let s=0; for(const k in a) s+= a[k]*a[k]; return Math.sqrt(s)||1; }
+
+    function searchQuery(query, topK=3){
+      const qtf = termFreq(query);
+      // compute query vector using same idf as chunks (estimate idf)
+      // build idf from current chunks
+      const idf = computeIdf(chunks.map(c=>c.text));
+      const qvec = tfIdfVector(qtf, idf);
+      const scores = chunks.map((c, idx) => ({idx, score: cosine(c.vector, qvec), text: c.text}));
+      scores.sort((a,b)=>b.score - a.score);
+      return scores.slice(0, topK).filter(s=>s.score>0);
+    }
+
+    function cosine(a,b){
+      return dot(a,b)/(norm(a)*norm(b));
+    }
+
+    function renderResults(query, results){
+      answersDiv.innerHTML = '';
+      if (!results.length){
+        answersDiv.innerHTML = '<div class="answer">No good matches found. Try rephrasing, or extract text again.</div>';
+        return;
+      }
+      for (const r of results){
+        const el = document.createElement('div'); el.className='answer';
+        el.innerHTML = `<div style="font-size:13px;color:var(--muted)">Score: ${r.score.toFixed(3)}</div><div style="margin-top:6px">${escapeHtml(r.text)}</div>`;
+        answersDiv.appendChild(el);
+      }
+    }
+
+    // small helper to escape HTML
+    function escapeHtml(s){ return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+
+    // ======= OPTIONAL: also answer by extracting specific sentences that contain keywords ======
+    // (Not used by default; left here for extension)
+
+  </script>
+</body>
+</html>
